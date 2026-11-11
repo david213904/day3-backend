@@ -272,6 +272,68 @@ def air_history(station: str, limit: int = 48):
     return res.data
 
 
+# ───────────── 예측: DB에 쌓인 시계열로 선형회귀 (다음 시간 미세먼지) ─────────────
+from datetime import datetime
+
+
+def linreg(xs, ys):
+    """최소제곱법 y = a*x + b (라이브러리 없이 직접 계산). 점이 부족하면 None."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    a = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return a, my - a * mx
+
+
+def _forecast_one(points, key, hours):
+    """points: [(datetime, row)] 시간순. key 값으로 hours시간 뒤까지 예측."""
+    pts = [(t, r[key]) for t, r in points if r.get(key) is not None]
+    if len(pts) < 3:
+        return None
+    t0 = pts[0][0]
+    xs = [(t - t0).total_seconds() / 3600 for t, _ in pts]
+    ys = [v for _, v in pts]
+    fit = linreg(xs, ys)
+    if not fit:
+        return None
+    a, b = fit
+    last = xs[-1]
+    out = [max(0.0, round(a * (last + h) + b, 1)) for h in range(1, hours + 1)]
+    return {"next": out, "slope_per_hour": round(a, 2), "points": len(pts)}
+
+
+@app.get("/air/forecast")
+def air_forecast(hours: int = 3, window: int = 48):
+    """측정소별 PM10/PM2.5 최근 window개 값에 선형회귀를 적용해 앞으로 hours시간을 예측."""
+    hours = max(1, min(hours, 12))
+    try:
+        rows = (sb.table("air_quality").select("station_name,data_time,pm10,pm25")
+                .order("data_time", desc=True).limit(1000).execute().data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase 오류: {e}")
+    by = {}
+    for r in rows:
+        try:
+            t = datetime.strptime(r["data_time"], "%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            continue
+        by.setdefault(r["station_name"], []).append((t, r))
+    result = {}
+    for name, pts in by.items():
+        pts.sort(key=lambda p: p[0])
+        pts = pts[-max(3, min(window, 200)):]
+        result[name] = {
+            "history": [{"t": r["data_time"], "pm10": r["pm10"], "pm25": r["pm25"]} for _, r in pts],
+            "pm10": _forecast_one(pts, "pm10", hours),
+            "pm25": _forecast_one(pts, "pm25", hours),
+        }
+    return {"hours": hours, "method": "linear_regression", "stations": result}
+
+
 async def _collect_loop():
     while True:
         try:
