@@ -16,7 +16,7 @@ create table if not exists public.air_quality (
   o3 numeric, no2 numeric, co numeric, so2 numeric,
   khai numeric, khai_grade int,
   created_at timestamptz not null default now(),
-  unique (station_name, data_time)
+  unique (sido_name, station_name, data_time)   -- 측정소 이름은 시·도마다 겹침('중구' 등)
 );
 alter table public.air_quality enable row level security;
 -- Supabase → SQL Editor 에 붙여 넣고 Run
@@ -48,3 +48,6 @@ saved int -- 저장된 행 개수
 -- 브라우저에서 직접 못 건드리게 잠금. FastAPI는 secret 키라서 통과.
 alter table air_readings enable row level security;
 alter table collect_logs enable row level security;
+-- ───── 전국 확장용 마이그레이션 (이미 air_quality 테이블이 있을 때 Supabase SQL Editor에서 1번 실행) ─────
+-- alter table public.air_quality drop constraint if exists air_quality_station_name_data_time_key;
+-- alter table public.air_quality add constraint air_quality_sido_station_time_key unique (sido_name, station_name, data_time);

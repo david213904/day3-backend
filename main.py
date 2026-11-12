@@ -176,16 +176,25 @@ def clear_cart(cart_id: str):
 # 서비스키는 서버(.env / Railway Variables)에만 두고, 브라우저에는 노출하지 않는다.
 import asyncio
 import time
+from datetime import datetime
 
 import httpx
 from fastapi import Header
 
 DATA_GO_KR_KEY = os.getenv("DATA_GO_KR_KEY", "").strip()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-SIDO_NAME = os.getenv("SIDO_NAME", "제주").strip()
+SIDO_NAME = os.getenv("SIDO_NAME", "제주").strip()          # /air 기본 지역
 COLLECT_MINUTES = int(os.getenv("COLLECT_MINUTES", "60") or 60)
 AIR_URL = "https://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getCtprvnRltmMesureDnsty"
-_air_cache = {"at": 0.0, "rows": []}
+
+# 에어코리아가 쓰는 시·도 이름 17개
+ALL_SIDOS = ["서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종", "경기",
+             "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주"]
+# 매 시간 DB에 저장할 시·도 (쉼표로 구분, 비우면 전국). 예: COLLECT_SIDOS=제주
+COLLECT_SIDOS = [s.strip() for s in os.getenv("COLLECT_SIDOS", "").split(",") if s.strip()] or ALL_SIDOS
+
+_air_cache = {}                       # {시도: {"at": 시각, "rows": [...]}}
+_nat_cache = {"at": 0.0, "data": None}
 
 
 def _num(v):
@@ -199,16 +208,17 @@ def _grade(v):
     return int(v) if v and str(v).isdigit() else None
 
 
-async def fetch_air():
-    """공공데이터 API에서 시도별 실시간 측정값을 가져와 필요한 항목만 정리한다."""
+async def fetch_air(sido=None):
+    """공공데이터 API에서 한 시·도의 실시간 측정값을 가져와 필요한 항목만 정리한다."""
+    sido = sido or SIDO_NAME
     if not DATA_GO_KR_KEY:
         raise HTTPException(status_code=500, detail="DATA_GO_KR_KEY 가 설정되지 않았습니다")
     params = {
-        "serviceKey": DATA_GO_KR_KEY, "returnType": "json", "numOfRows": 100,
-        "pageNo": 1, "sidoName": SIDO_NAME, "ver": "1.0",
+        "serviceKey": DATA_GO_KR_KEY, "returnType": "json", "numOfRows": 500,
+        "pageNo": 1, "sidoName": sido, "ver": "1.0",
     }
     try:
-        async with httpx.AsyncClient(timeout=15) as c:
+        async with httpx.AsyncClient(timeout=20) as c:
             r = await c.get(AIR_URL, params=params)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"공공데이터 서버 연결 실패: {type(e).__name__}: {e}")
@@ -218,64 +228,125 @@ async def fetch_air():
             raise ValueError(body["header"]["resultMsg"])
         items = body["body"]["items"]
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"공공데이터 응답 오류: {e}")
+        raise HTTPException(status_code=502, detail=f"공공데이터 응답 오류({sido}): {e}")
     return [{
         "station_name": it["stationName"],
-        "sido_name": it["sidoName"],
+        "sido_name": it.get("sidoName") or sido,
         "data_time": it["dataTime"],
         "pm10": _num(it.get("pm10Value")), "pm10_grade": _grade(it.get("pm10Grade")),
         "pm25": _num(it.get("pm25Value")), "pm25_grade": _grade(it.get("pm25Grade")),
         "o3": _num(it.get("o3Value")), "no2": _num(it.get("no2Value")),
         "co": _num(it.get("coValue")), "so2": _num(it.get("so2Value")),
         "khai": _num(it.get("khaiValue")), "khai_grade": _grade(it.get("khaiGrade")),
-    } for it in items]
+    } for it in items if it.get("stationName") and it.get("dataTime")]
 
 
 def save_air(rows):
-    """DB 저장. 같은 (측정소, 측정시각)은 덮어쓰기라서 중복되지 않는다."""
-    sb.table("air_quality").upsert(rows, on_conflict="station_name,data_time").execute()
+    """DB 저장. 같은 (시도, 측정소, 측정시각)은 덮어쓰기라서 중복되지 않는다.
+    (측정소 이름은 시·도마다 겹칠 수 있다: 예 '중구' → 시도 이름까지 키에 포함)"""
+    uniq = {(r["sido_name"], r["station_name"], r["data_time"]): r for r in rows}
+    rows = list(uniq.values())
+    for i in range(0, len(rows), 500):
+        sb.table("air_quality").upsert(rows[i:i + 500], on_conflict="sido_name,station_name,data_time").execute()
+
+
+def _check_sido(sido):
+    if sido not in ALL_SIDOS:
+        raise HTTPException(status_code=400, detail=f"시도 이름이 올바르지 않습니다: {', '.join(ALL_SIDOS)}")
+    return sido
+
+
+async def _rows_cached(sido, ttl=300):
+    c = _air_cache.get(sido)
+    if not c or time.time() - c["at"] > ttl or not c["rows"]:
+        _air_cache[sido] = c = {"rows": await fetch_air(sido), "at": time.time()}
+    return c["rows"]
 
 
 @app.get("/air")
-async def get_air():
-    # 5분 캐시: 새로고침을 반복해도 공공데이터 호출 횟수를 아낀다
-    if time.time() - _air_cache["at"] > 300 or not _air_cache["rows"]:
-        _air_cache["rows"] = await fetch_air()
-        _air_cache["at"] = time.time()
+async def get_air(sido: str = ""):
+    sido = _check_sido(sido or SIDO_NAME)
+    rows = await _rows_cached(sido)        # 5분 캐시: 새로고침을 반복해도 공공데이터 호출을 아낀다
     saved = True
     try:
-        await asyncio.to_thread(save_air, _air_cache["rows"])
+        await asyncio.to_thread(save_air, rows)
     except Exception:
-        saved = False  # 테이블 미생성/키 문제여도 화면 표시는 계속한다
-    return {"sido": SIDO_NAME, "saved_to_db": saved, "items": _air_cache["rows"]}
+        saved = False  # 테이블 미생성/제약조건 문제여도 화면 표시는 계속한다
+    return {"sido": sido, "saved_to_db": saved, "items": rows}
+
+
+def _avg(vals):
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+@app.get("/air/national")
+async def air_national():
+    """전국 17개 시·도의 측정소 값을 한 번에: 시도별 평균 + 측정소 목록 (10분 캐시)."""
+    if _nat_cache["data"] and time.time() - _nat_cache["at"] < 600:
+        return _nat_cache["data"]
+    sem = asyncio.Semaphore(4)            # 공공데이터 서버에 한꺼번에 몰리지 않게
+
+    async def one(s):
+        async with sem:
+            try:
+                return s, await _rows_cached(s, ttl=600)
+            except HTTPException:
+                return s, None
+
+    results = await asyncio.gather(*[one(s) for s in ALL_SIDOS])
+    sidos, all_rows = {}, []
+    for s, rows in results:
+        if rows is None:
+            continue
+        all_rows += rows
+        sidos[s] = {
+            "count": len(rows),
+            "avg_pm10": _avg([r["pm10"] for r in rows]),
+            "avg_pm25": _avg([r["pm25"] for r in rows]),
+            "items": [{k: r[k] for k in ("station_name", "data_time", "pm10", "pm10_grade", "pm25", "pm25_grade")}
+                      for r in rows],
+        }
+    if not sidos:
+        raise HTTPException(status_code=502, detail="전국 데이터를 가져오지 못했습니다")
+    saved = True
+    try:
+        await asyncio.to_thread(save_air, all_rows)
+    except Exception:
+        saved = False
+    data = {"saved_to_db": saved, "sidos": sidos}
+    _nat_cache.update(at=time.time(), data=data)
+    return data
 
 
 @app.post("/admin/collect")
 async def collect(x_admin_token: str = Header(default="")):
     if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="관리자 토큰이 올바르지 않습니다")
-    rows = await fetch_air()
-    try:
-        await asyncio.to_thread(save_air, rows)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Supabase 오류: {e}")
-    return {"saved": len(rows)}
+    total = 0
+    for s in COLLECT_SIDOS:
+        rows = await fetch_air(s)
+        try:
+            await asyncio.to_thread(save_air, rows)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Supabase 오류: {e}")
+        total += len(rows)
+    return {"saved": total, "sidos": COLLECT_SIDOS}
 
 
 @app.get("/air/history/{station}")
-def air_history(station: str, limit: int = 48):
+def air_history(station: str, limit: int = 48, sido: str = ""):
     try:
-        res = (sb.table("air_quality").select("*").eq("station_name", station)
-               .order("data_time", desc=True).limit(min(limit, 200)).execute())
+        q = sb.table("air_quality").select("*").eq("station_name", station)
+        if sido:
+            q = q.eq("sido_name", sido)
+        res = q.order("data_time", desc=True).limit(min(limit, 200)).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supabase 오류: {e}")
     return res.data
 
 
 # ───────────── 예측: DB에 쌓인 시계열로 선형회귀 (다음 시간 미세먼지) ─────────────
-from datetime import datetime
-
-
 def linreg(xs, ys):
     """최소제곱법 y = a*x + b (라이브러리 없이 직접 계산). 점이 부족하면 None."""
     n = len(xs)
@@ -306,13 +377,27 @@ def _forecast_one(points, key, hours):
     return {"next": out, "slope_per_hour": round(a, 2), "points": len(pts)}
 
 
+def _recent_rows(sido, max_rows=5000):
+    """한 시·도의 최근 기록을 최신순으로 (Supabase는 한 번에 1000행까지라 나눠서 읽는다)."""
+    rows, start = [], 0
+    while len(rows) < max_rows:
+        part = (sb.table("air_quality").select("station_name,data_time,pm10,pm25")
+                .eq("sido_name", sido).order("data_time", desc=True)
+                .range(start, start + 999).execute().data)
+        rows += part
+        if len(part) < 1000:
+            break
+        start += 1000
+    return rows
+
+
 @app.get("/air/forecast")
-def air_forecast(hours: int = 3, window: int = 48):
+def air_forecast(hours: int = 3, window: int = 48, sido: str = ""):
     """측정소별 PM10/PM2.5 최근 window개 값에 선형회귀를 적용해 앞으로 hours시간을 예측."""
+    sido = _check_sido(sido or SIDO_NAME)
     hours = max(1, min(hours, 12))
     try:
-        rows = (sb.table("air_quality").select("station_name,data_time,pm10,pm25")
-                .order("data_time", desc=True).limit(1000).execute().data)
+        rows = _recent_rows(sido)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supabase 오류: {e}")
     by = {}
@@ -331,15 +416,17 @@ def air_forecast(hours: int = 3, window: int = 48):
             "pm10": _forecast_one(pts, "pm10", hours),
             "pm25": _forecast_one(pts, "pm25", hours),
         }
-    return {"hours": hours, "method": "linear_regression", "stations": result}
+    return {"sido": sido, "hours": hours, "method": "linear_regression", "stations": result}
 
 
 async def _collect_loop():
     while True:
-        try:
-            await asyncio.to_thread(save_air, await fetch_air())
-        except Exception:
-            pass
+        for s in COLLECT_SIDOS:
+            try:
+                await asyncio.to_thread(save_air, await fetch_air(s))
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         await asyncio.sleep(max(COLLECT_MINUTES, 1) * 60)
 
 
