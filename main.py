@@ -193,7 +193,10 @@ ALL_SIDOS = ["서울", "부산", "대구", "인천", "광주", "대전", "울산
 # 매 시간 DB에 저장할 시·도 (쉼표로 구분, 비우면 전국). 예: COLLECT_SIDOS=제주
 COLLECT_SIDOS = [s.strip() for s in os.getenv("COLLECT_SIDOS", "").split(",") if s.strip()] or ALL_SIDOS
 
-_air_cache = {}                       # {시도: {"at": 시각, "rows": [...]}}
+_api_down_until = 0.0                 # 이 시각 전까지는 공공데이터 호출을 건너뜀(연결 실패 직후)
+FIELDS = ("station_name", "sido_name", "data_time", "pm10", "pm10_grade", "pm25", "pm25_grade",
+          "o3", "no2", "co", "so2", "khai", "khai_grade")
+_air_cache = {}                       # {시도: {"at": 시각, "rows": [...], "source": "live"|"db"}}
 _nat_cache = {"at": 0.0, "data": None}
 
 
@@ -217,10 +220,14 @@ async def fetch_air(sido=None):
         "serviceKey": DATA_GO_KR_KEY, "returnType": "json", "numOfRows": 500,
         "pageNo": 1, "sidoName": sido, "ver": "1.0",
     }
+    global _api_down_until
+    if time.time() < _api_down_until:      # 방금 연결이 안 됐으면 잠시 시도하지 않고 바로 저장본으로
+        raise HTTPException(status_code=503, detail="공공데이터 서버 연결 불가 (잠시 후 재시도)")
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=6)) as c:
             r = await c.get(AIR_URL, params=params)
     except httpx.HTTPError as e:
+        _api_down_until = time.time() + 120
         raise HTTPException(status_code=502, detail=f"공공데이터 서버 연결 실패: {type(e).__name__}: {e}")
     try:
         body = r.json()["response"]
@@ -256,23 +263,57 @@ def _check_sido(sido):
     return sido
 
 
+def _latest_from_db(sido=None, max_rows=4000):
+    """DB에 쌓아 둔 기록에서 측정소별 가장 최근 값 (공공데이터에 연결이 안 될 때의 대비책)."""
+    rows, start = [], 0
+    while len(rows) < max_rows:
+        q = sb.table("air_quality").select("*").order("data_time", desc=True)
+        if sido:
+            q = q.eq("sido_name", sido)
+        part = q.range(start, start + 999).execute().data
+        rows += part
+        if len(part) < 1000:
+            break
+        start += 1000
+    seen, out = set(), []
+    for r in rows:
+        k = (r["sido_name"], r["station_name"])
+        if k not in seen:
+            seen.add(k)
+            out.append({f: r.get(f) for f in FIELDS})
+    return out
+
+
 async def _rows_cached(sido, ttl=300):
+    """(rows, source) 반환. source 는 'live'(공공데이터) 또는 'db'(저장해 둔 최신 값)."""
     c = _air_cache.get(sido)
-    if not c or time.time() - c["at"] > ttl or not c["rows"]:
-        _air_cache[sido] = c = {"rows": await fetch_air(sido), "at": time.time()}
-    return c["rows"]
+    if c and c["rows"] and time.time() - c["at"] <= (ttl if c["source"] == "live" else 60):
+        return c["rows"], c["source"]
+    try:
+        rows, source = await fetch_air(sido), "live"
+    except HTTPException:
+        try:
+            rows, source = await asyncio.to_thread(_latest_from_db, sido), "db"
+        except Exception:
+            rows = []
+        if not rows:
+            raise
+    _air_cache[sido] = {"rows": rows, "at": time.time(), "source": source}
+    return rows, source
 
 
 @app.get("/air")
 async def get_air(sido: str = ""):
     sido = _check_sido(sido or SIDO_NAME)
-    rows = await _rows_cached(sido)        # 5분 캐시: 새로고침을 반복해도 공공데이터 호출을 아낀다
-    saved = True
-    try:
-        await asyncio.to_thread(save_air, rows)
-    except Exception:
-        saved = False  # 테이블 미생성/제약조건 문제여도 화면 표시는 계속한다
-    return {"sido": sido, "saved_to_db": saved, "items": rows}
+    rows, source = await _rows_cached(sido)    # 5분 캐시: 새로고침을 반복해도 공공데이터 호출을 아낀다
+    saved = source == "db"                     # 저장본을 보여주는 중이면 이미 DB에 있는 값
+    if source == "live":
+        saved = True
+        try:
+            await asyncio.to_thread(save_air, rows)
+        except Exception:
+            saved = False  # 테이블 미생성/제약조건 문제여도 화면 표시는 계속한다
+    return {"sido": sido, "saved_to_db": saved, "source": source, "items": rows}
 
 
 def _avg(vals):
@@ -295,12 +336,16 @@ async def air_national():
                 return s, None
 
     results = await asyncio.gather(*[one(s) for s in ALL_SIDOS])
-    sidos, all_rows = {}, []
-    for s, rows in results:
-        if rows is None:
+    sidos, all_rows, sources = {}, [], set()
+    for s, res in results:
+        if res is None:
             continue
-        all_rows += rows
+        rows, source = res
+        sources.add(source)
+        if source == "live":
+            all_rows += rows
         sidos[s] = {
+            "source": source,
             "count": len(rows),
             "avg_pm10": _avg([r["pm10"] for r in rows]),
             "avg_pm25": _avg([r["pm25"] for r in rows]),
@@ -310,12 +355,15 @@ async def air_national():
     if not sidos:
         raise HTTPException(status_code=502, detail="전국 데이터를 가져오지 못했습니다")
     saved = True
-    try:
-        await asyncio.to_thread(save_air, all_rows)
-    except Exception:
-        saved = False
-    data = {"saved_to_db": saved, "sidos": sidos}
-    _nat_cache.update(at=time.time(), data=data)
+    if all_rows:
+        try:
+            await asyncio.to_thread(save_air, all_rows)
+        except Exception:
+            saved = False
+    data = {"saved_to_db": saved, "source": "live" if sources == {"live"} else "db" if sources == {"db"} else "mixed",
+            "sidos": sidos}
+    # 저장본을 섞어 보여줄 때는 오래 캐시하지 않는다 (공공데이터가 살아나면 바로 반영)
+    _nat_cache.update(at=time.time() if data["source"] == "live" else time.time() - 540, data=data)
     return data
 
 
